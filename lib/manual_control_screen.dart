@@ -25,10 +25,10 @@ class ManualControlScreen extends StatefulWidget {
 }
 
 class ManualControlScreenState extends State<ManualControlScreen> {
+
   //============================================================
   // Constants & Saved Boundaries
   //============================================================
-
 
   // your main (green) boundary, already closed:
   final List<Offset> mainBoundary = [
@@ -339,14 +339,19 @@ class ManualControlScreenState extends State<ManualControlScreen> {
   double _markerAngle = 0.0;        // heading in radians
 
   static const double _joySize = 145.0;    // on‑screen joystick diameter
-  static const double _step    = 2.0;      // forward movement increment
   static const double _iconSize = 16.0;    // mower icon size
+
+  /// how many logical “pixels” to move per joystick tick
+  static const double _normalStep     = 2.0;   // your existing mower speed
+  static const double _planningStep   = 4.0;   // black cursor
+  static const double _startingStep   = 3.0;   // white cursor
+
 
   bool _canTurn = true;                   // rate‑limit turns
   static const double _turnThreshold = 0.6;
 
   final _rng = Random();
-  static const double _jitterRad = 0.3;   // simulate imperfect straight lines
+  static const double _jitterRad = 0.0;   // simulate imperfect straight lines
 
   //============================================================
   // 3) UNDO / REDO FOR MAIN BOUNDARY
@@ -365,17 +370,13 @@ class ManualControlScreenState extends State<ManualControlScreen> {
   Timer? _reconnectTimer;
 
   //============================================================
-  // 4.1) Recording & Replay State for Manual “Plan Mow”
+  // 4.1) Plan and Start Mow
   //============================================================
 
-  bool        _recording    = false;   // are we in record mode?
-  Offset      _planMarker   = Offset.zero; // the little planning dot
-  final List<Offset> _planTrail    = [];     // recorded positions
-  final List<Offset> planPath = [];
-  bool        _playingPlan  = false;   // are we replaying?
-  int         _playIndex    = 0;
-  Timer?      _playTimer;
-  final List<Offset> _replayTrail = [];      // points drawn during replay animation
+  bool _planningMode  = false;   // “Mow Planning” button pressed
+  bool _startingMode  = false;   // “Start Planning” button pressed
+  final List<Offset> _planTrail     = [];
+  final List<Offset> _startTrail    = [];
 
   //============================================================
   // 5) LIFECYCLE
@@ -398,13 +399,21 @@ class ManualControlScreenState extends State<ManualControlScreen> {
       final hole1   = _Polygon(points: noGo1,       closed: true);
 
       setState(() {
-        _polygons
-          ..clear()
-          ..add(mainPoly)
-          ..add(hole1);
-        _drawingMain   = false;            // drawing is finished
+        // _polygons
+        //   ..clear()
+        //   ..add(mainPoly)
+        //   ..add(hole1);
+        // _drawingMain   = false;            // drawing is finished
+        // _activePolygon = 0;
+        // _marker        = mainBoundary.first;
+        // _didInit       = true;
+
+        _polygons.clear();
+        // Start with an empty main boundary; user can trace it in “drawingMain” mode:
+        _polygons.add(_Polygon(points: [center], closed: false));
+        _drawingMain   = true;
         _activePolygon = 0;
-        _marker        = mainBoundary.first;
+        _marker        = center;
         _didInit       = true;
       });
     });
@@ -477,38 +486,116 @@ class ManualControlScreenState extends State<ManualControlScreen> {
       }
     }
 
-    // forward motion: two paths depending on _recording
-    if (dy < -0.5) {
+    if (d.y < -0.5) {
+      // compute your next position exactly as before…
       final jitter = (_rng.nextDouble()*2 - 1) * _jitterRad;
       final noisy  = _markerAngle + jitter;
       final forward= Offset(sin(noisy), -cos(noisy));
+      final size   = MediaQuery.of(context).size;
 
-      // choose planMarker if recording, else the main marker
-      Offset next = (_recording ? _planMarker : _marker) + forward*_step;
+      // pick the right step size
+      final double step = _planningMode
+          ? _planningStep
+          : _startingMode
+          ? _startingStep
+          : _normalStep;
 
-      // clamp to screen and keep inside main boundary
-      final size = MediaQuery.of(context).size;
+      var next = _marker + forward * step;
       next = Offset(
         next.dx.clamp(_iconSize/2, size.width  - _iconSize/2),
         next.dy.clamp(_iconSize/2, size.height*0.6 - _iconSize/2),
       );
-      if (!_drawingMain && !_pointInPoly(next, _polygons[0].points)) {
-        return; // ignore step if outside boundary
+
+      final poly = _polygons[_activePolygon];
+      // auto‑close logic
+      if (_drawingMain
+          && !poly.closed
+          && poly.points.length >= 10               // ← only if you've drawn ≥10 points
+          && (next - poly.points.first).distance < 10) {
+          next = poly.points.first;
+          poly.closed = true;
+          _drawingMain = false;
+          Fluttertoast.showToast(msg: 'Main auto‑closed!');
+
+      } else if (_noGoMode
+          && !poly.closed
+          && poly.points.length >= 10               // ← also require ≥10
+          && (next - poly.points.first).distance < 10) {
+          next = poly.points.first;
+          poly.closed = true;
+          _noGoMode = false;
+          Fluttertoast.showToast(msg: 'No‑go #$_activePolygon auto‑closed!');
+
       }
 
-      setState(() {
-        if (_recording) {
-          _planMarker = next;
-          _planTrail.add(next);
-        } else {
+
+      bool inMain = _pointInPoly(next, _polygons[0].points);
+      bool inHole = _polygons
+          .skip(1)                                    // all of your “red” holes
+          .any((h) => h.closed && _pointInPoly(next, h.points));
+
+      // only allow moves inside the green boundary
+      // if (_drawingMain || _pointInPoly(next, _polygons[0].points)) {
+        if (_drawingMain || (inMain && !inHole)) {
+        setState(() {
+
+          // ✏️ If we're drawing the main boundary, record the current marker
+          if (_drawingMain) {
+            final poly = _polygons[_activePolygon];
+            poly.points.add(_marker);
+          }else if (_noGoMode) {
+            final poly = _polygons[_activePolygon];
+            poly.points.add(_marker);
+          }
+
           _marker = next;
           _sendMessage(_direction);
-        }
-      });
+
+          // record into the active trail
+          if (_planningMode) {
+            _planTrail.add(next);
+          } else if (_startingMode) {
+            _startTrail.add(next);
+          }
+        });
+      }
     }
 
-    // normalize angle
     _markerAngle %= 2*pi;
+
+    // forward motion: two paths depending on _recording
+    // if (dy < -0.5) {
+    //   // compute your next position
+    //   final jitter = (_rng.nextDouble()*2 - 1) * _jitterRad;
+    //   final noisy  = _markerAngle + jitter;
+    //   final forward= Offset(sin(noisy), -cos(noisy));
+    //   final size   = MediaQuery.of(context).size;
+    //   var next = _marker + forward*_step;
+    //   next = Offset(
+    //     next.dx.clamp(_iconSize/2, size.width  - _iconSize/2),
+    //     next.dy.clamp(_iconSize/2, size.height*0.6 - _iconSize/2),
+    //   );
+    //
+    //   // **only** allow moves if you’re either still drawing the main boundary
+    //   // or if it’s already closed and you’re inside it
+    //   if (_drawingMain ||
+    //       (!_drawingMain && _pointInPoly(next, _polygons[0].points))) {
+    //
+    //     setState(() {
+    //       // ✏️ record this vertex in the active polygon
+    //       final poly = _polygons[_activePolygon];
+    //       if (!poly.closed) {
+    //         poly.points.add(_marker);
+    //       }
+    //
+    //       // now actually move the marker
+    //       _marker = next;
+    //       _sendMessage(_direction);
+    //     });
+    //   }
+    // }
+    //
+    // _markerAngle %= 2*pi;
   }
 
   /// Even–odd rule point‑in‑polygon test
@@ -573,6 +660,10 @@ class ManualControlScreenState extends State<ManualControlScreen> {
       _mainUndo.clear();
       _mainRedo.clear();
       _markerAngle = 0.0;
+      _planningMode  = false;   // “Mow Planning” button pressed
+      _startingMode  = false;   // “Start Planning” button pressed
+       _planTrail.clear();
+       _startTrail.clear();
     });
   }
 
@@ -596,47 +687,8 @@ class ManualControlScreenState extends State<ManualControlScreen> {
     dev.log(buffer.toString());
   }
 
-  /// Dumps your manual record `_planTrail` to the log so you can copy/paste.
-  void _exportPlanTrail() {
-    final buf = StringBuffer()
-      ..writeln('/// Hard‑coded plan:')
-      ..writeln('final List<Offset> planPath = [');
-    for (var p in _planTrail) {
-      buf.writeln('  Offset(${p.dx.toStringAsFixed(2)}, ${p.dy.toStringAsFixed(2)}),');
-    }
-    buf.writeln('];');
-    dev.log(buf.toString());
-  }
-
   //============================================================
-  // 10) Replay Hard‑coded Plan
-  //============================================================
-
-  void _replayPlan() {
-    setState(() {
-      _playingPlan  = true;
-      _playIndex    = 0;
-      _replayTrail.clear();
-      _marker       = planPath.first;   // jump to start
-      _replayTrail.add(_marker);
-    });
-    _playTimer?.cancel();
-    _playTimer = Timer.periodic(Duration(milliseconds: 20), (t) {
-      if (_playIndex >= planPath.length) {
-        t.cancel();
-        setState(() => _playingPlan = false);
-        return;
-      }
-      setState(() {
-        final next = planPath[_playIndex++];
-        _marker = next;
-        _replayTrail.add(next);
-      });
-    });
-  }
-
-  //============================================================
-  // 11) BUILD UI
+  // 10) BUILD UI
   //============================================================
 
   @override
@@ -678,10 +730,8 @@ class ManualControlScreenState extends State<ManualControlScreen> {
                       size: MediaQuery.of(context).size,
                       painter: _BoundaryPainter(
                         _polygons,
-                        _replayTrail,
-                        recording: _recording,
-                        planTrail: _planTrail,
-                        planMarker: _planMarker,
+                        _planTrail,
+                        _startTrail
                       ),
                     ),
 
@@ -693,9 +743,10 @@ class ManualControlScreenState extends State<ManualControlScreen> {
                         angle: _markerAngle,
                         child: Icon(
                           Icons.circle,
-                          // Icons.arrow_upward,
                           size: _iconSize,
-                          color: _drawingMain ? Colors.green : Colors.red,
+                          color: _planningMode ? Colors.black
+                              : _startingMode ? Colors.white
+                              : (_drawingMain ? Colors.green : Colors.red),
                         ),
                       ),
                     ),
@@ -709,22 +760,19 @@ class ManualControlScreenState extends State<ManualControlScreen> {
                           Row(
                             children: [
                               // Status dot + record toggle:
-                              Row(
-                                  children: [
-                                Container(
-                                  width:16, height:16,
-                                  decoration: BoxDecoration(
-                                    color: statusColor,
-                                    shape: BoxShape.circle,
+                              InkWell(
+                                onTap: _exportBoundaries,
+                                child: Row(
+                                    children: [
+                                  Container(
+                                    width:16, height:16,
+                                    decoration: BoxDecoration(
+                                      color: statusColor,
+                                      shape: BoxShape.circle,
+                                    ),
                                   ),
-                                ),
-                                SizedBox(width:8),
-                                InkWell(
-                                  onTap: () {
-                                    _exportPlanTrail();
-                                    setState(() => _recording = false);
-                                  },
-                                  child: Container(
+                                  SizedBox(width:8),
+                                  Container(
                                     padding: EdgeInsets.symmetric(horizontal:12,vertical:8),
                                     decoration: BoxDecoration(
                                       color: Colors.black54,
@@ -735,18 +783,18 @@ class ManualControlScreenState extends State<ManualControlScreen> {
                                       style: TextStyle(color: Colors.white),
                                     ),
                                   ),
-                                ),
-                              ]),
+                                ]),
+                              ),
 
                               Spacer(),
                               // Replay Plan button:
                               ElevatedButton(
                                 onPressed: (){
                                   setState(() {
-                                    _recording   = true;
+                                    _planningMode = true;
+                                    _startingMode = false;
                                     _planTrail.clear();
-                                    _planMarker  = _polygons[0].points.first;
-                                    _planTrail.add(_planMarker);
+                                    _planTrail.add(_marker);
                                   });
                                 },
                                 style: ElevatedButton.styleFrom(
@@ -767,10 +815,11 @@ class ManualControlScreenState extends State<ManualControlScreen> {
                               ElevatedButton(
                                 onPressed: (){
                                   setState(() {
-                                    _recording   = true;
-                                    _planTrail.clear();
-                                    _planMarker  = _polygons[0].points.first;
-                                    _planTrail.add(_planMarker);
+                                    _startingMode = true;
+                                    _planningMode = false;
+                                    _marker = mainBoundary.first;      // jump to start
+                                    _startTrail.clear();
+                                    _startTrail.add(_marker);
                                   });
                                 },
                                 style: ElevatedButton.styleFrom(
@@ -792,17 +841,14 @@ class ManualControlScreenState extends State<ManualControlScreen> {
 
                           SizedBox(height:10),
                           // ESP32 response box (tap also replays)
-                          InkWell(
-                            onTap: _replayPlan,
-                            child: Container(
-                              padding: EdgeInsets.symmetric(horizontal:12,vertical:8),
-                              decoration: BoxDecoration(
-                                color: Colors.black54,
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                              child: Text("ESP32: $response",
-                                  style: TextStyle(color:Colors.white)),
+                          Container(
+                            padding: EdgeInsets.symmetric(horizontal:12,vertical:8),
+                            decoration: BoxDecoration(
+                              color: Colors.black54,
+                              borderRadius: BorderRadius.circular(8),
                             ),
+                            child: Text("ESP32: $response",
+                                style: TextStyle(color:Colors.white)),
                           ),
                         ],
                       ),
@@ -827,13 +873,13 @@ class ManualControlScreenState extends State<ManualControlScreen> {
                     Row(mainAxisAlignment: MainAxisAlignment.center, children: [
                       ElevatedButton(
                         onPressed: _closePolygon,
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
                         child: Text(_drawingMain ? 'Close Main' : 'Close No-Go'),
                       ),
                       SizedBox(width:15),
                       ElevatedButton(
                         onPressed: _startNoGo,
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.green, foregroundColor: Colors.white),
                         child: Text('Start No‑Go'),
                       ),
                     ]),
@@ -871,55 +917,108 @@ class ManualControlScreenState extends State<ManualControlScreen> {
 /// Paints all polygons **and** the replay trail.
 class _BoundaryPainter extends CustomPainter {
   final List<_Polygon> polys;
-  final List<Offset>   replayTrail;
-  final bool          recording;
-  final List<Offset>  planTrail;
-  final Offset        planMarker;
+  final List<Offset>   planTrail;
+  final List<Offset>   startTrail;
 
-  _BoundaryPainter(
-      this.polys,
-      this.replayTrail, {
-        required this.recording,
-        required this.planTrail,
-        required this.planMarker,
-      });
+  _BoundaryPainter(this.polys, this.planTrail, this.startTrail);
 
   @override
   void paint(Canvas c, Size s) {
-    // 0️⃣ Draw the planning trail (during record):
-    if (recording && planTrail.length > 1) {
-      final pPaint = Paint()
-        ..color       = Colors.white.withOpacity(0.8)
-        ..strokeWidth = 10.0                 // ← pick your “mower width”
-        ..strokeCap   = StrokeCap.round      // ← rounded ends
-        ..style       = PaintingStyle.stroke;
-      final pPath = Path()..moveTo(planTrail[0].dx, planTrail[0].dy);
-      for (var pt in planTrail.skip(1)) {
-        pPath.lineTo(pt.dx, pt.dy);
-      }
-      c.drawPath(pPath, pPaint);
-    }
-  // Draw the planning dot as a circle:
-    if (recording) {
-      c.drawCircle(
-        planMarker,
-        6,    // radius
-        Paint()..color = Colors.white,
-      );
-    }
 
-    // 1) Draw replay trail first so it sits under polygons:
-    if (replayTrail.length > 1) {
+    // if user is still drawing the main boundary:
+    final mainPoly = polys[0];
+    if (!mainPoly.closed && mainPoly.points.length > 1) {
       final paint = Paint()
-        ..color       = Colors.white
+        ..color       = Colors.green
         ..strokeWidth = 3
         ..style       = PaintingStyle.stroke;
-      final path = Path()..moveTo(replayTrail[0].dx, replayTrail[0].dy);
-      for (var p in replayTrail.skip(1)) {
-        path.lineTo(p.dx, p.dy);
+      final path = Path()..moveTo(mainPoly.points[0].dx, mainPoly.points[0].dy);
+      for (var pt in mainPoly.points.skip(1)) {
+        path.lineTo(pt.dx, pt.dy);
       }
       c.drawPath(path, paint);
     }
+
+    // live no‑go holes
+    for (int i = 1; i < polys.length; i++) {
+      final hole = polys[i];
+      if (!hole.closed && hole.points.length > 1) {
+        final paint = Paint()
+          ..color       = Colors.green
+          ..strokeWidth = 3
+          ..style       = PaintingStyle.stroke;
+        final path = Path()..moveTo(mainPoly.points[0].dx, mainPoly.points[0].dy);
+        for (var pt in mainPoly.points.skip(1)) {
+          path.lineTo(pt.dx, pt.dy);
+        }
+        c.drawPath(path, paint);
+      }
+    }
+
+
+    // — build the allowed‐area: main boundary minus any holes —
+    bool didClip = false;
+    if (polys.isNotEmpty && polys[0].points.length > 2 && polys[0].closed) {
+      // 1) build main outline
+      final mainPath = Path()
+        ..moveTo(polys[0].points[0].dx, polys[0].points[0].dy);
+      for (var pt in polys[0].points.skip(1)) {
+        mainPath.lineTo(pt.dx, pt.dy);
+      }
+      mainPath.close();
+
+      // 2) subtract each closed hole
+      Path allowed = mainPath;
+      for (int i = 1; i < polys.length; i++) {
+        final hole = polys[i];
+        if (!hole.closed || hole.points.length < 3) continue;
+        final holePath = Path()..moveTo(hole.points[0].dx, hole.points[0].dy);
+        for (var pt in hole.points.skip(1)) {
+          holePath.lineTo(pt.dx, pt.dy);
+        }
+        holePath.close();
+        allowed = Path.combine(PathOperation.difference, allowed, holePath);
+      }
+
+      // 3) clip to that difference
+      c.save();
+      c.clipPath(allowed);
+      didClip = true;
+    }
+
+    // — draw mow‑planning trail in black —
+    if (planTrail.length > 1) {
+      final p = Paint()
+        ..color       = Colors.black
+        ..strokeWidth = 30  // you already defined constants
+        ..strokeCap   = StrokeCap.round
+        ..style       = PaintingStyle.stroke;
+      final path = Path()..moveTo(planTrail.first.dx, planTrail.first.dy);
+      for (var pt in planTrail.skip(1)) {
+        path.lineTo(pt.dx, pt.dy);
+      }
+      c.drawPath(path, p);
+    }
+
+    // — draw start‑planning trail in white —
+    if (startTrail.length > 1) {
+      final p = Paint()
+        ..color       = Colors.white
+        ..strokeWidth = 14
+        ..strokeCap   = StrokeCap.round
+        ..style       = PaintingStyle.stroke;
+      final path = Path()..moveTo(startTrail.first.dx, startTrail.first.dy);
+      for (var pt in startTrail.skip(1)) {
+        path.lineTo(pt.dx, pt.dy);
+      }
+      c.drawPath(path, p);
+    }
+
+    // — restore if we clipped —
+    if (didClip) {
+      c.restore();
+    }
+
 
     // 2) Draw each polygon (green main + red holes):
     for (var i = 0; i < polys.length; i++) {
